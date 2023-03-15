@@ -1,18 +1,18 @@
 use nom::{
     branch::alt,
-    bytes::complete::{is_not, tag, take_till, take_while, take_while1},
-    character::streaming::char,
-    combinator::{map_res, opt},
+    bytes::complete::{is_not, take_till, take_while, take_while1},
+    character::complete::char,
+    combinator::{map},
     error::{Error, ErrorKind, ParseError},
     multi::many0,
-    sequence::{delimited, preceded, terminated},
-    Err, Finish, IResult,
+    sequence::{delimited, preceded},
+    Err, IResult,
 };
 
-use crate::{Account, Entry, Field};
+use crate::item::{Field, Any};
 
 fn label(i: &str) -> IResult<&str, &str> {
-    preceded(char('#'), take_till(|c: char| c.is_whitespace()))(i)
+    preceded(char('#'), take_till(is_whitespace))(i)
 }
 
 fn is_whitespace(c: char) -> bool {
@@ -27,39 +27,41 @@ fn is_field_sep(c: char) -> bool {
     is_whitespace(c) || is_newline(c)
 }
 
-fn maybe_quoted(i: &str) -> IResult<&str, &str> {
-    alt((
-        delimited(char('\"'), is_not("\""), char('\"')),
-        take_while(|c: char| !is_field_sep(c)),
-    ))(i)
+fn complex_field(i: &str) -> IResult<&str, Vec<Any>> {
+    let (i, o) = delimited(char('{'), take_until_unbalanced('{', '}'), char('}'))(i)?;
+    let (_, o) = items(o)?;
+    Ok((i, o)) // forward everything after the ending delimeter
 }
 
 fn field(i: &str) -> IResult<&str, Field> {
-    dbg!(i);
-    map_res(
-        alt((
-            delimited(char('{'), take_until_unbalanced('{', '}'), char('}')),
-            maybe_quoted,
-        )),
-        |s| s.parse(),
-    )(i)
+    alt((
+        map(complex_field, Field::Complex),
+        map(
+            delimited(char('\"'), is_not("\""), char('\"')),
+            |s: &str| Field::Text(s.to_owned()),
+        ),
+        map(
+            take_while1(|c: char| !is_field_sep(c) && c != '#'),
+            |s: &str| Field::Text(s.to_owned()),
+        ),
+    ))(i)
 }
 
-pub fn item(i: &str) -> IResult<&str, Entry> {
+pub fn item(i: &str) -> IResult<&str, Any> {
+    let (i, _) = take_while(is_field_sep)(i)?;
     let (i, tag) = label(i)?;
-    // todo: stop this many0 loop on '#'
     let (i, fields) = many0(preceded(take_while1(is_field_sep), field))(i)?;
 
     Ok((
         i,
-        Entry {
+        Any {
             tag: tag.to_owned(),
             fields,
         },
     ))
 }
 
-pub fn items(i: &str) -> IResult<&str, Vec<Entry>> {
+pub fn items(i: &str) -> IResult<&str, Vec<Any>> {
     many0(item)(i)
 }
 
@@ -71,7 +73,7 @@ pub fn items(i: &str) -> IResult<&str, Vec<Entry>> {
 /// ```
 /// use nom::bytes::complete::tag;
 /// use nom::sequence::delimited;
-/// use parse_hyperlinks::take_until_unbalanced;
+/// use sie4::parsers::take_until_unbalanced;
 ///
 /// let mut parser = delimited(tag("<"), take_until_unbalanced('<', '>'), tag(">"));
 /// assert_eq!(parser("<<inside>inside>abc"), Ok(("abc", "<inside>inside")));
@@ -125,35 +127,107 @@ pub fn take_until_unbalanced(
     }
 }
 
+#[cfg(test)]
 mod tests {
-    use nom::Finish;
+    use crate::item::Any;
 
-    use crate::{parsers::label, Account, Entry, Field};
+    use super::*;
 
-    use super::item;
+    macro_rules! text {
+        ($lit:literal) => {
+            Field::Text($lit.to_owned())
+        };
+    }
 
     #[test]
     fn parse_item() {
-        let (i, Entry { tag, fields }) = item("#KONTO 1220 \"Inventarier och verktyg\"").unwrap();
+        let (i, Any { tag, fields }) = item("#KONTO 1220 \"Inventarier och verktyg\"").unwrap();
 
         assert_eq!(i, "");
         assert_eq!(tag, "KONTO");
         assert_eq!(
             fields,
-            vec![
-                Field::Text("1220".to_owned()),
-                Field::Text("Inventarier och verktyg".to_owned())
-            ]
+            vec![text!("1220"), text!("Inventarier och verktyg")]
         );
 
-        // let Account { no, name } = item("#KONTO 1220 \"Inventarier och verktyg\"").unwrap();
+        let (_i, Any { tag, fields }) = item(
+            "
+#VER A 42 20230314 \"Pi Day\" 20230314
+{
+    #TRANS 1930 {} -72.00 20230228 \"Pie\"
+    #TRANS 4007 {} 72.00 20230228 \"Pie\"
+}
 
-        // assert_eq!(no, 1220);
-        // assert_eq!(name, "Inventarier och verktyg".to_owned());
+# VER A 43",
+        )
+        .unwrap();
+
+        assert_eq!(tag, "VER");
+        assert_eq!(
+            fields,
+            vec![
+                text!("A"),
+                text!("42"),
+                text!("20230314"),
+                text!("Pi Day"),
+                text!("20230314"),
+                Field::Complex(vec![
+                    Any {
+                        tag: "TRANS".to_owned(),
+                        fields: vec![
+                            text!("1930"),
+                            Field::Complex(vec![]),
+                            text!("-72.00"),
+                            text!("20230228"),
+                            text!("Pie"),
+                        ]
+                    },
+                    Any {
+                        tag: "TRANS".to_owned(),
+                        fields: vec![
+                            text!("4007"),
+                            Field::Complex(vec![]),
+                            text!("72.00"),
+                            text!("20230228"),
+                            text!("Pie")
+                        ]
+                    }
+                ])
+            ]
+        )
     }
 
     #[test]
     fn parse_label() {
         assert_eq!(label("#KONTO 1220"), Ok((" 1220", "KONTO")))
+    }
+
+    #[test]
+    fn parse_complex() {
+        assert_eq!(complex_field(
+            "{
+#TRANS 4015 {} 185.00
+#TRANS 1930 {} -185.00
+        }",
+        ), Ok(("", vec![Any {
+            tag: "TRANS".to_owned(),
+            fields: vec![
+                text!("4015"),
+                Field::Complex(vec![]),
+                text!("185.00"),
+            ]
+        }, Any {
+            tag: "TRANS".to_owned(),
+            fields: vec![
+                text!("1930"),
+                Field::Complex(vec![]),
+                text!("-185.00")
+            ]
+        }])));
+    }
+
+    #[test]
+    fn parse_items_strange_input() {
+        assert_eq!(items(""), Ok(("", vec![])));
     }
 }

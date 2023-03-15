@@ -1,6 +1,7 @@
-use std::{borrow::Cow, collections::HashMap, env, fs::File, io::Read, iter::Once};
+use std::{borrow::Cow, env, fs::File, io::Read, time::Instant};
 
 use codepage_437::{BorrowFromCp437, CP437_CONTROL};
+use sie4::items;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -11,11 +12,11 @@ fn main() -> anyhow::Result<()> {
 
     let data = Cow::borrow_from_cp437(&cp437, &CP437_CONTROL);
 
-    // println!("{data}");
+    let before = Instant::now();
 
-    // println!("{:?}", hello_parser("#KONTO 1228 \"Ackumulerade nedskrivningar på inventarier och verktyg\""));
-    // println!("{:?}", hello_parser("#HEJ"));
-    // println!("{:?}", hello_parser("goodbye hello again"));
+    dbg!(items(&data).unwrap().1);
+
+    println!("{:?}", before.elapsed());
 
     Ok(())
 }
