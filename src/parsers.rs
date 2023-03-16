@@ -2,16 +2,14 @@ use nom::{
     branch::alt,
     bytes::complete::{is_not, take_till, take_while, take_while1},
     character::complete::char,
-    combinator::{map},
+    combinator::map,
     error::{Error, ErrorKind, ParseError},
     multi::many0,
     sequence::{delimited, preceded},
     Err, IResult,
 };
 
-use crate::item::{Field, Any};
-
-fn label(i: &str) -> IResult<&str, &str> {
+pub fn label(i: &str) -> IResult<&str, &str> {
     preceded(char('#'), take_till(is_whitespace))(i)
 }
 
@@ -23,46 +21,105 @@ fn is_newline(c: char) -> bool {
     c == '\n' || c == '\r'
 }
 
-fn is_field_sep(c: char) -> bool {
-    is_whitespace(c) || is_newline(c)
-}
+pub mod field {
+    use std::str::FromStr;
 
-fn complex_field(i: &str) -> IResult<&str, Vec<Any>> {
-    let (i, o) = delimited(char('{'), take_until_unbalanced('{', '}'), char('}'))(i)?;
-    let (_, o) = items(o)?;
-    Ok((i, o)) // forward everything after the ending delimeter
-}
+    use nom::{combinator::map_res, multi::separated_list0};
+    use time::{format_description::FormatItem, macros::format_description, Date};
 
-fn field(i: &str) -> IResult<&str, Field> {
-    alt((
-        map(complex_field, Field::Complex),
-        map(
+    use super::*;
+
+    pub const DATE_FORMAT: &[FormatItem] = format_description!("[year][month][day]");
+
+    pub fn is_sep(c: char) -> bool {
+        is_whitespace(c) || is_newline(c)
+    }
+
+    // pub fn take_sep0(i: &str) -> IResult<&str, &str> {
+    //     take_while(is_sep)(i)
+    // }
+
+    pub fn take_sep1(i: &str) -> IResult<&str, &str> {
+        take_while1(is_sep)(i)
+    }
+
+    fn in_curly_braces(i: &str) -> IResult<&str, &str> {
+        delimited(char('{'), take_until_unbalanced('{', '}'), char('}'))(i)
+    }
+
+    pub fn list(i: &str) -> IResult<&str, Vec<&str>> {
+        let (i, o) = in_curly_braces(i)?;
+        separated_list0(take_sep1, text)(o).map(|(_, o)| (i, o))
+    }
+
+    pub fn sub_items<O, F>(f: F) -> impl Fn(&str) -> IResult<&str, Vec<O>>
+    where
+        F: Fn(&str) -> IResult<&str, O>,
+    {
+        move |i: &str| {
+            let (i, o) = in_curly_braces(i)?;
+            many0(|s| f(s))(o).map(|(_, o)| (i, o))
+        }
+    }
+
+    pub fn text(i: &str) -> IResult<&str, &str> {
+        alt((
             delimited(char('\"'), is_not("\""), char('\"')),
-            |s: &str| Field::Text(s.to_owned()),
-        ),
-        map(
-            take_while1(|c: char| !is_field_sep(c) && c != '#'),
-            |s: &str| Field::Text(s.to_owned()),
-        ),
-    ))(i)
+            take_while1(|c: char| !is_sep(c) && c != '#'),
+        ))(i)
+    }
+
+    pub fn next<'a, O, F>(f: F) -> impl Fn(&'a str) -> IResult<&'a str, O>
+    where
+        F: Fn(&'a str) -> IResult<&'a str, O>,
+    {
+        move |i: &'a str| {
+            let (i, _) = take_sep1(i)?;
+            f(i)
+        }
+    }
+
+    pub fn parse_next<T>(i: &str) -> IResult<&str, T>
+    where
+        T: FromStr,
+        T::Err: std::fmt::Debug,
+    {
+        map_res(next(text), |s| s.parse())(i)
+    }
+
+    pub fn next_string(i: &str) -> IResult<&str, String> {
+        map(next(text), |s| s.to_owned())(i)
+    }
+
+    pub fn next_date(i: &str) -> IResult<&str, Date> {
+        map_res(next(text), |s| Date::parse(s, DATE_FORMAT))(i)
+    }
+
+    // pub fn any(i: &str) -> IResult<&str, Field> {
+    //     alt((
+    //         map(list, |v| {
+    //             Field::List(v.into_iter().map(|s| s.to_owned()).collect())
+    //         }),
+    //         map(text, |s| Field::Text(s.to_owned())),
+    //     ))(i)
+    // }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_list() {
+            assert_eq!(
+                list("{482 \"423\" 14}",),
+                Ok(("", vec!["482", "423", "14"]))
+            );
+        }
+    }
 }
 
-pub fn item(i: &str) -> IResult<&str, Any> {
-    let (i, _) = take_while(is_field_sep)(i)?;
-    let (i, tag) = label(i)?;
-    let (i, fields) = many0(preceded(take_while1(is_field_sep), field))(i)?;
-
-    Ok((
-        i,
-        Any {
-            tag: tag.to_owned(),
-            fields,
-        },
-    ))
-}
-
-pub fn items(i: &str) -> IResult<&str, Vec<Any>> {
-    many0(item)(i)
+pub fn take_till_label(i: &str) -> IResult<&str, &str> {
+    take_while(|c| c != '#')(i)
 }
 
 /// A parser similar to `nom::bytes::complete::take_until()`, except that this
@@ -129,105 +186,10 @@ pub fn take_until_unbalanced(
 
 #[cfg(test)]
 mod tests {
-    use crate::item::Any;
-
     use super::*;
-
-    macro_rules! text {
-        ($lit:literal) => {
-            Field::Text($lit.to_owned())
-        };
-    }
-
-    #[test]
-    fn parse_item() {
-        let (i, Any { tag, fields }) = item("#KONTO 1220 \"Inventarier och verktyg\"").unwrap();
-
-        assert_eq!(i, "");
-        assert_eq!(tag, "KONTO");
-        assert_eq!(
-            fields,
-            vec![text!("1220"), text!("Inventarier och verktyg")]
-        );
-
-        let (_i, Any { tag, fields }) = item(
-            "
-#VER A 42 20230314 \"Pi Day\" 20230314
-{
-    #TRANS 1930 {} -72.00 20230228 \"Pie\"
-    #TRANS 4007 {} 72.00 20230228 \"Pie\"
-}
-
-# VER A 43",
-        )
-        .unwrap();
-
-        assert_eq!(tag, "VER");
-        assert_eq!(
-            fields,
-            vec![
-                text!("A"),
-                text!("42"),
-                text!("20230314"),
-                text!("Pi Day"),
-                text!("20230314"),
-                Field::Complex(vec![
-                    Any {
-                        tag: "TRANS".to_owned(),
-                        fields: vec![
-                            text!("1930"),
-                            Field::Complex(vec![]),
-                            text!("-72.00"),
-                            text!("20230228"),
-                            text!("Pie"),
-                        ]
-                    },
-                    Any {
-                        tag: "TRANS".to_owned(),
-                        fields: vec![
-                            text!("4007"),
-                            Field::Complex(vec![]),
-                            text!("72.00"),
-                            text!("20230228"),
-                            text!("Pie")
-                        ]
-                    }
-                ])
-            ]
-        )
-    }
 
     #[test]
     fn parse_label() {
         assert_eq!(label("#KONTO 1220"), Ok((" 1220", "KONTO")))
-    }
-
-    #[test]
-    fn parse_complex() {
-        assert_eq!(complex_field(
-            "{
-#TRANS 4015 {} 185.00
-#TRANS 1930 {} -185.00
-        }",
-        ), Ok(("", vec![Any {
-            tag: "TRANS".to_owned(),
-            fields: vec![
-                text!("4015"),
-                Field::Complex(vec![]),
-                text!("185.00"),
-            ]
-        }, Any {
-            tag: "TRANS".to_owned(),
-            fields: vec![
-                text!("1930"),
-                Field::Complex(vec![]),
-                text!("-185.00")
-            ]
-        }])));
-    }
-
-    #[test]
-    fn parse_items_strange_input() {
-        assert_eq!(items(""), Ok(("", vec![])));
     }
 }

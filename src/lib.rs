@@ -1,13 +1,23 @@
-use std::{fmt::{Debug, self}, str::FromStr};
+use item::Item;
+use nom::{multi::many0, IResult};
+use parsers::take_till_label;
 
-mod item;
-pub mod parsers;
+pub mod item;
+mod parsers;
 
-pub type AccountNo = u32;
-
-pub struct Account {
-    pub no: AccountNo,
-    pub name: String,
+pub fn parse_items(i: &str) -> IResult<&str, Vec<Item>> {
+    many0(|i| {
+        let (i, _) = take_till_label(i)?;
+        Item::parse(i)
+    })(i)
 }
 
-pub use parsers::items;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_items_strange_input() {
+        assert_eq!(parse_items(""), Ok(("", vec![])));
+    }
+}
