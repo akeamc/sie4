@@ -1,11 +1,18 @@
 use std::fmt::Debug;
 
-use nom::{bytes::complete::take_while1, combinator::map, IResult};
+use nom::{
+    bytes::complete::take_while1,
+    combinator::{map, map_res, opt},
+    IResult,
+};
 use rust_decimal::Decimal;
 use time::Date;
 
 use crate::parsers::{
-    field::{list, next, next_date, next_string, parse_next, sub_items, text},
+    field::{
+        list, next, next_date, next_string, next_string_opt, parse_next, sub_items, text,
+        DATE_FORMAT,
+    },
     label, take_till_label,
 };
 
@@ -139,6 +146,7 @@ pub struct Transaction {
     pub account_no: u32,
     pub amount: Amount,
     pub date: Option<Date>,
+    pub text: Option<String>,
 }
 
 impl ParsableItem for Transaction {
@@ -149,14 +157,18 @@ impl ParsableItem for Transaction {
         let (i, account_no) = parse_next(i)?;
         let (i, _l) = next(list)(i)?;
         let (i, amount) = parse_next(i)?;
-        let (i, date) = next_date(i)?;
+        let (i, date) = map_res(opt(next(text)), |o| {
+            o.map(|s| Date::parse(s, DATE_FORMAT)).transpose()
+        })(i)?;
+        let (i, text) = next_string_opt(i)?;
 
         Ok((
             i,
             Self {
                 account_no,
                 amount,
-                date: Some(date),
+                date,
+                text,
             },
         ))
     }
@@ -250,18 +262,51 @@ mod tests {
                             amount: dec!(-72.00),
                             date: Some(
                                 Date::from_calendar_date(2023, Month::February, 28).unwrap()
-                            )
+                            ),
+                            text: Some("Pie".to_owned())
                         },
                         Transaction {
                             account_no: 4007,
                             amount: dec!(72.00),
                             date: Some(
                                 Date::from_calendar_date(2023, Month::February, 28).unwrap()
-                            )
+                            ),
+                            text: Some("Pie".to_owned())
                         }
                     ]
                 })
             ))
         );
+    }
+
+    #[test]
+    fn parse_transaction() {
+        assert_eq!(
+            Transaction::parse(" 1930 {} 192.00 20230320 \"Stonks\""),
+            Ok((
+                "",
+                Transaction {
+                    account_no: 1930,
+                    amount: dec!(192.00),
+                    date: Some(Date::from_calendar_date(2023, Month::March, 20).unwrap()),
+                    text: Some("Stonks".to_owned())
+                }
+            ))
+        );
+
+        assert_eq!(
+            Transaction::parse(" 1930 {} 583.52"),
+            Ok((
+                "",
+                Transaction {
+                    account_no: 1930,
+                    amount: dec!(583.52),
+                    date: None,
+                    text: None,
+                }
+            ))
+        );
+
+        assert!(Transaction::parse(" 1930 {} 583.52 \"Stonks\"").is_err());
     }
 }

@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
             "Kommentar",
             "Belopp",
             "Σ",
-            format!("Budget ({budget})")
+            format!("Budgetöverskott ({budget})")
         ));
 
         let mut sum = Decimal::ZERO;

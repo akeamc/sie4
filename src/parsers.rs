@@ -24,7 +24,10 @@ fn is_newline(c: char) -> bool {
 pub mod field {
     use std::str::FromStr;
 
-    use nom::{combinator::map_res, multi::separated_list0};
+    use nom::{
+        combinator::{map_res, opt},
+        multi::separated_list0,
+    };
     use time::{format_description::FormatItem, macros::format_description, Date};
 
     use super::*;
@@ -89,6 +92,10 @@ pub mod field {
 
     pub fn next_string(i: &str) -> IResult<&str, String> {
         map(next(text), |s| s.to_owned())(i)
+    }
+
+    pub fn next_string_opt(i: &str) -> IResult<&str, Option<String>> {
+        map(opt(next(text)), |s| s.map(ToOwned::to_owned))(i)
     }
 
     pub fn next_date(i: &str) -> IResult<&str, Date> {
