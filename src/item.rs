@@ -1,20 +1,32 @@
 use std::fmt::Debug;
 
+use codepage_437::{BorrowFromCp437, CP437_CONTROL};
+use iso_currency::Currency;
 use nom::{
-    bytes::complete::take_while1,
-    combinator::{map, map_res, opt},
+    branch::alt,
+    bytes::streaming::{tag, take_while},
+    character::streaming::{char, digit1},
+    combinator::{complete, cut, map, map_res, opt, recognize},
+    error::context,
+    multi::many0,
+    sequence::preceded,
     IResult,
 };
 use rust_decimal::Decimal;
-use time::Date;
+use time::{format_description::FormatItem, macros::format_description, Date};
 
-use crate::parsers::{
-    field::{
-        list, next, next_date, next_string, next_string_opt, parse_next, sub_items, text,
-        DATE_FORMAT,
-    },
-    label, take_till_label,
+use crate::{
+    parsers::{self, date, in_curly_braces, is_line_break, is_whitespace, text, unquoted_text},
+    Span,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Group {
+    Flag,
+    Identification,
+    Account,
+    Balance,
+}
 
 type Amount = Decimal;
 
@@ -24,289 +36,472 @@ pub enum Field {
     List(Vec<String>),
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct Flag {
-    pub read: bool,
-}
-
-impl ParsableItem for Flag {
-    fn parse(i: &str) -> IResult<&str, Self>
-    where
-        Self: Sized,
-    {
-        let (i, flag) = next(text)(i)?;
-        let read = match flag {
-            "0" => false,
-            "1" => true,
-            _ => panic!(),
-        };
-
-        Ok((i, Self { read }))
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct Program {
-    pub name: String,
-    pub version: String,
-}
-
-impl ParsableItem for Program {
-    fn parse(i: &str) -> IResult<&str, Self>
-    where
-        Self: Sized,
-    {
-        let (i, name) = next_string(i)?;
-        let (i, version) = next_string(i)?;
-
-        Ok((i, Self { name, version }))
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct Account {
-    pub no: u32,
-    pub name: String,
-}
-
-impl ParsableItem for Account {
-    fn parse(i: &str) -> IResult<&str, Self>
-    where
-        Self: Sized,
-    {
-        let (i, no) = parse_next(i)?;
-        let (i, name) = next_string(i)?;
-
-        Ok((i, Self { no, name }))
-    }
-}
-
-/// SIE4 verification.
-///
-/// ```text
-/// #VER A 1 20190101 "Test"
-/// {
-///     #TRANS 1930 {} 192.00 "Test"
-///     #TRANS 8720 {} -192.00 "Test"
-/// }
-/// ```
-#[derive(Debug, PartialEq, Eq)]
-pub struct Verification {
-    pub series: String,
-    pub no: u32,
-    pub date: Date,
-    pub name: String,
-    pub transactions: Vec<Transaction>,
-}
-
-impl ParsableItem for Verification {
-    fn parse(i: &str) -> IResult<&str, Self>
-    where
-        Self: Sized,
-    {
-        let (i, series) = next_string(i)?;
-        let (i, no) = parse_next(i)?;
-        let (i, date) = next_date(i)?;
-        let (i, name) = next_string(i)?;
-
-        let (i, _) = take_while1(|c| c != '{')(i)?;
-        let (i, transactions) = sub_items(|i| {
-            let (i, _) = take_till_label(i)?;
-            let (i, label) = label(i)?;
-            if label != "TRANS" {
-                panic!("VER sub-items must be TRANS");
-            }
-            Transaction::parse(i)
-        })(i)?;
-
-        if !transactions
-            .iter()
-            .map(|t| t.amount)
-            .sum::<Decimal>()
-            .is_zero()
-        {
-            panic!("VER transactions must sum to zero");
-        }
-
-        Ok((
-            i,
-            Self {
-                series,
-                no,
-                date,
-                name,
-                transactions,
-            },
-        ))
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct Transaction {
-    pub account_no: u32,
-    pub amount: Amount,
-    pub date: Option<Date>,
-    pub text: Option<String>,
-}
-
-impl ParsableItem for Transaction {
-    fn parse(i: &str) -> IResult<&str, Self>
-    where
-        Self: Sized,
-    {
-        let (i, account_no) = parse_next(i)?;
-        let (i, _l) = next(list)(i)?;
-        let (i, amount) = parse_next(i)?;
-        let (i, date) = map_res(opt(next(text)), |o| {
-            o.map(|s| Date::parse(s, DATE_FORMAT)).transpose()
-        })(i)?;
-        let (i, text) = next_string_opt(i)?;
-
-        Ok((
-            i,
-            Self {
-                account_no,
-                amount,
-                date,
-                text,
-            },
-        ))
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Item {
-    Flag(Flag),
-    Program(Program),
-    Account(Account),
-    Verification(Verification),
-    Unknown(String, Vec<Field>),
-}
-
 trait ParsableItem {
-    fn parse(i: &str) -> IResult<&str, Self>
+    fn parse(i: Span) -> IResult<Span, Self>
     where
         Self: Sized;
 }
 
-fn parse_unknown_item(i: &str) -> IResult<&str, Vec<Field>> {
-    Ok((i, vec![]))
+pub const DATE_FORMAT: &[FormatItem] = format_description!("[year][month][day]");
+
+trait ParseField {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized;
 }
 
-macro_rules! labels {
-  (
-    $label:ident, $rest:ident,
-    $($item_label:literal => $item:ident),*
-  ) => {
-    match $label {
-        $($item_label => map($item::parse, Item::$item)($rest),)*
-        _ => map(parse_unknown_item, |fields| Item::Unknown($label.to_owned(), fields))($rest)
+pub trait Sie4Item {
+    const LABEL: &'static str;
+
+    const GROUP: Group;
+
+    fn parse_item(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized;
+}
+
+impl ParseField for String {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        map(text, |s| s.to_string())(i)
     }
-  }
 }
 
-impl Item {
-    pub fn parse(i: &str) -> IResult<&str, Self> {
-        let (i, label) = label(i)?;
+impl ParseField for bool {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        alt((map(tag("0"), |_| false), map(tag("1"), |_| true)))(i)
+    }
+}
 
-        labels! {
-            label, i,
-            "FLAGGA" => Flag,
-            "PROGRAM" => Program,
-            "KONTO" => Account,
-            "VER" => Verification
+impl ParseField for Date {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        let (i, s) = unquoted_text(i)?;
+        let (_, date) = cut(date)(s)?;
+        Ok((i, date))
+    }
+}
+
+impl ParseField for Currency {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        let (i, s) = unquoted_text(i)?;
+        let (_, currency) = cut(parsers::from_str)(s)?;
+        Ok((i, currency))
+    }
+}
+
+impl ParseField for Decimal {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        let (i, s) = unquoted_text(i)?;
+        let (_, value) = cut(parsers::from_str)(s)?;
+        Ok((i, value))
+    }
+}
+
+impl<T: ParseField> ParseField for Option<T> {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        opt(T::parse_field)(i)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SubItems<T>(pub Vec<T>);
+
+impl<T: Sie4Item> ParseField for SubItems<T> {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        let (i, _) = take_while(|c| is_whitespace(c) || is_line_break(c))(i)?;
+        let (i, o) = in_curly_braces(i)?;
+        let (_, items) = many0(complete(|i| {
+            let (i, _) = take_while(|c| c != b'#')(i)?;
+            let (i, _) = preceded(char('#'), tag(T::LABEL))(i)?;
+            T::parse_item(i)
+        }))(o)?;
+
+        Ok((i, Self(items)))
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct List<T>(pub Vec<T>);
+
+impl<T: ParseField> ParseField for List<T> {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        let (i, o) = in_curly_braces(i)?;
+        // many0(T::parse_field("")) will return an `Incomplete` error, but
+        // we know that o is complete.
+        let (_, o) = many0(complete(T::parse_field))(o)?;
+
+        Ok((i, Self(o)))
+    }
+}
+
+impl<T> From<Vec<T>> for List<T> {
+    fn from(value: Vec<T>) -> Self {
+        Self(value)
+    }
+}
+
+macro_rules! parse_num_impl {
+    ($ty:ty) => {
+        impl ParseField for $ty {
+            fn parse_field(i: Span) -> IResult<Span, Self>
+            where
+                Self: Sized,
+            {
+                map_res(recognize(preceded(opt(tag("-")), cut(digit1))), |b| {
+                    std::borrow::Cow::borrow_from_cp437(&b, &CP437_CONTROL).parse()
+                })(i)
+            }
         }
+    };
+}
+
+parse_num_impl!(i32);
+parse_num_impl!(u32);
+
+macro_rules! item_impl {
+    ($name:ident ($group:ident) {
+        $($field:ident: $ty:ty,)*
+    }) => {
+        paste::paste! {
+            #[derive(Debug, PartialEq, Eq)]
+            pub struct $name {
+                $(
+                    pub $field: $ty,
+                )*
+            }
+
+            impl Sie4Item for $name {
+                const LABEL: &'static str = stringify!([<$name:upper>]);
+
+                const GROUP: Group = Group::$group;
+
+                fn parse_item(i: Span) -> IResult<Span, Self> {
+                    $(
+                        let (i, _) = take_while(is_whitespace)(i)?;
+                        let (i, $field) = context(stringify!($field), <$ty>::parse_field)(i)?;
+                    )*
+
+                    Ok((i, Self {
+                        $($field,)*
+                    }))
+                }
+            }
+        }
+    };
+}
+
+macro_rules! items_impl {
+    {$($name:ident ($group:ident) $body:tt)*} => {
+        #[derive(Debug, PartialEq, Eq)]
+        pub enum Item {
+            $(
+                $name($name),
+            )*
+        }
+
+        $(
+            item_impl!($name ($group) $body);
+        )*
+
+        impl Item {
+            pub fn parse(i: Span) -> IResult<Span, Self> {
+                let (i, _) = take_while(|c| is_whitespace(c) || is_line_break(c))(i)?;
+
+                paste::paste! {
+                    preceded(tag("#"), alt(($(
+                        map(
+                            preceded(tag(stringify!([<$name:upper>])), $name::parse_item),
+                            Self::$name,
+                        ),
+                    )*)))(i)
+                }
+            }
+
+            #[must_use]
+            pub const fn group(&self) -> Group {
+                paste::paste! {
+                    match self {
+                        $(
+                            Self::$name(_) => $name::GROUP,
+                        )*
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FormatType {
+    PC8,
+}
+
+impl ParseField for FormatType {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        map(tag("PC8"), |_| FormatType::PC8)(i)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TypeNo {
+    SIE4,
+}
+
+impl ParseField for TypeNo {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        map(tag("4"), |_| TypeNo::SIE4)(i)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChartAccountsType {
+    Bas95,
+    Bas96,
+    EuBas97,
+    Ne2007,
+}
+
+impl ParseField for ChartAccountsType {
+    fn parse_field(i: Span) -> IResult<Span, Self>
+    where
+        Self: Sized,
+    {
+        context(
+            "account type",
+            alt((
+                map(tag("BAS95"), |_| ChartAccountsType::Bas95),
+                map(tag("BAS96"), |_| ChartAccountsType::Bas96),
+                map(tag("EUBAS97"), |_| ChartAccountsType::EuBas97),
+                map(tag("NE2007"), |_| ChartAccountsType::Ne2007),
+            )),
+        )(i)
+    }
+}
+
+items_impl! {
+    Adress (Identification) {
+        contact: String,
+        distribution_address: String,
+        postal_address: String,
+        phone: String,
+    }
+    BKod (Identification) {
+        sni: String,
+    }
+    Flagga (Flag) {
+        read: bool,
+    }
+    FNamn (Identification) {
+        name: String,
+    }
+    Format (Identification) {
+        format: FormatType,
+    }
+    Gen (Identification) {
+        date: Date,
+        signature: Option<String>,
+    }
+    Ib (Balance) {
+        year: i32,
+        account: u32,
+        balance: Amount,
+        quantity: Option<String>,
+    }
+    Konto (Account) {
+        no: u32,
+        name: String,
+    }
+    KpTyp (Identification) {
+        typ: ChartAccountsType,
+    }
+    Orgnr (Identification) {
+        org_no: String,
+    }
+    Program (Identification) {
+        name: String,
+        version: String,
+    }
+    Rar (Identification) {
+        no: i32,
+        start: Date,
+        end: Date,
+    }
+    Res (Balance) {
+        year: i32,
+        account: u32,
+        balance: Amount,
+        quantity: Option<String>,
+    }
+    SieTyp (Identification) {
+        no: TypeNo,
+    }
+    Trans (Balance) {
+        account: u32,
+        objects: List<String>,
+        amount: Amount,
+        date: Option<Date>,
+        text: Option<String>,
+        quantity: Option<String>,
+        signature: Option<String>,
+    }
+    Ub (Balance) {
+        year: i32,
+        account: u32,
+        balance: Amount,
+        quantity: Option<String>,
+    }
+    Valuta (Identification) {
+        currency: Currency,
+    }
+    Ver (Balance) {
+        series: String,
+        no: u32,
+        date: Date,
+        text: Option<String>,
+        reg_date: Option<Date>,
+        sign: Option<String>,
+        transactions: SubItems<Trans>,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-    use time::Month;
-
     use super::*;
+
+    use rust_decimal_macros::dec;
+    use time::macros::date;
+
+    #[test]
+    fn optional() {
+        // invalid date
+        assert!(Option::<Date>::parse_field(Span::new(b"20201301 \"next\"")).is_err());
+
+        // missing date
+        assert_eq!(
+            Option::<Date>::parse_field(Span::new(b" \"next\"")),
+            Ok((Span::new(b" \"next\""), None))
+        );
+
+        // invalid currency
+        assert!(Option::<Currency>::parse_field(Span::new(b"BTC \"next\"")).is_err());
+    }
 
     #[test]
     fn parse_item() {
         assert_eq!(
-            Item::parse("#KONTO 1220 \"Inventarier och verktyg\""),
-            Ok((
-                "",
-                Item::Account(Account {
-                    no: 1220,
-                    name: "Inventarier och verktyg".to_owned()
-                })
-            ))
+            Item::parse(Span::new(b"#KONTO 1220 \"Inventarier och verktyg\"\n"))
+                .unwrap()
+                .1,
+            Item::Konto(Konto {
+                no: 1220,
+                name: "Inventarier och verktyg".to_owned()
+            })
         );
 
         assert_eq!(
-            Item::parse(
-                "#VER A 42 20230314 \"Pi Day\" 20230314
+            Item::parse(Span::new(
+                b"#VER A 42 20230314 \"Pi Day\" 20230314
 {
-  #TRANS 1930 {} -72.00 20230228 \"Pie\"
-  #TRANS 4007 {} 72.00 20230228 \"Pie\"
+    #TRANS 1930 {} -72.00 20230228 \"Pie\"
+    #TRANS 4007 {} 72.00 20230228 \"Pie\"
 }
 
-# VER A 43",
-            ),
-            Ok((
-                "\n\n# VER A 43",
-                Item::Verification(Verification {
-                    series: "A".to_owned(),
-                    no: 42,
-                    date: Date::from_calendar_date(2023, Month::March, 14).unwrap(),
-                    name: "Pi Day".to_owned(),
-                    transactions: vec![
-                        Transaction {
-                            account_no: 1930,
-                            amount: dec!(-72.00),
-                            date: Some(
-                                Date::from_calendar_date(2023, Month::February, 28).unwrap()
-                            ),
-                            text: Some("Pie".to_owned())
-                        },
-                        Transaction {
-                            account_no: 4007,
-                            amount: dec!(72.00),
-                            date: Some(
-                                Date::from_calendar_date(2023, Month::February, 28).unwrap()
-                            ),
-                            text: Some("Pie".to_owned())
-                        }
-                    ]
-                })
-            ))
+# VER A 43"
+            ),)
+            .unwrap()
+            .1,
+            Item::Ver(Ver {
+                series: "A".to_owned(),
+                no: 42,
+                date: date!(2023 - 03 - 14),
+                text: Some("Pi Day".to_owned()),
+                reg_date: Some(date!(2023 - 03 - 14)),
+                sign: None,
+                transactions: SubItems(vec![
+                    Trans {
+                        account: 1930,
+                        objects: List(vec![]),
+                        amount: dec!(-72.00),
+                        date: Some(date!(2023 - 02 - 28)),
+                        text: Some("Pie".to_owned()),
+                        quantity: None,
+                        signature: None,
+                    },
+                    Trans {
+                        account: 4007,
+                        objects: List(vec![]),
+                        amount: dec!(72.00),
+                        date: Some(date!(2023 - 02 - 28)),
+                        text: Some("Pie".to_owned()),
+                        quantity: None,
+                        signature: None,
+                    }
+                ])
+            })
         );
     }
 
     #[test]
     fn parse_transaction() {
         assert_eq!(
-            Transaction::parse(" 1930 {} 192.00 20230320 \"Stonks\""),
-            Ok((
-                "",
-                Transaction {
-                    account_no: 1930,
-                    amount: dec!(192.00),
-                    date: Some(Date::from_calendar_date(2023, Month::March, 20).unwrap()),
-                    text: Some("Stonks".to_owned())
-                }
-            ))
+            Trans::parse_item(Span::new(b" 1930 {} 192.00 20230320 \"Stonks\"\n"))
+                .unwrap()
+                .1,
+            Trans {
+                account: 1930,
+                objects: Default::default(),
+                amount: dec!(192.00),
+                date: Some(date!(2023 - 03 - 20)),
+                text: Some("Stonks".to_owned()),
+                quantity: None,
+                signature: None,
+            }
         );
 
         assert_eq!(
-            Transaction::parse(" 1930 {} 583.52"),
-            Ok((
-                "",
-                Transaction {
-                    account_no: 1930,
-                    amount: dec!(583.52),
-                    date: None,
-                    text: None,
-                }
-            ))
+            Trans::parse_item(Span::new(b" 1930 {}\t\t 583.52\n"))
+                .unwrap()
+                .1,
+            Trans {
+                account: 1930,
+                objects: Default::default(),
+                amount: dec!(583.52),
+                date: None,
+                text: None,
+                quantity: None,
+                signature: None,
+            }
         );
 
-        assert!(Transaction::parse(" 1930 {} 583.52 \"Stonks\"").is_err());
+        assert!(Trans::parse_item(Span::new(b" 1930 {} 583.52 \"Stonks\"")).is_err());
     }
 }

@@ -1,3 +1,4 @@
 /target
 *.se
 *.csv
+Cargo.lock

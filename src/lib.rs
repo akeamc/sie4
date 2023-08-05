@@ -1,23 +1,10 @@
-use item::Item;
-use nom::{multi::many0, IResult};
-use parsers::take_till_label;
+#![warn(clippy::pedantic)]
 
 pub mod item;
 mod parsers;
+mod reader;
 
-pub fn parse_items(i: &str) -> IResult<&str, Vec<Item>> {
-    many0(|i| {
-        let (i, _) = take_till_label(i)?;
-        Item::parse(i)
-    })(i)
-}
+use nom_locate::LocatedSpan;
+pub use reader::Reader;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_items_strange_input() {
-        assert_eq!(parse_items(""), Ok(("", vec![])));
-    }
-}
+type Span<'a> = LocatedSpan<&'a [u8]>;
