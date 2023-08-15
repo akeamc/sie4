@@ -2,6 +2,12 @@
 name = "sie4"
 version = "0.1.0"
 edition = "2021"
+authors = ["akeamc"]
+description = "SIE4 parser"
+repository = "https://github.com/akeamc/sie4"
+license = "MIT"
+keywords = ["sie4", "nom", "parser"]
+categories = ["parser-implementations"]
 
 [workspace]
 members = ["."]
