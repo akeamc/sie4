@@ -1,23 +1,23 @@
-use std::io::{BufRead, Read};
+use std::io::{Read, BufRead};
 
-use nom::{Err, Finish, Offset};
+use nom_bufreader::bufreader::BufReader;
 
 use crate::{
     item::{Group, Item},
     Span,
 };
 
-pub struct Reader<R: BufRead> {
-    inner: R,
-    // buf: Vec<u8>,
-    // pos: usize,
+const BUF_SIZE: usize = 8192;
+
+pub struct Reader<R: Read> {
+    inner: BufReader<R>,
     group: Group,
 }
 
-impl<R: BufRead> Reader<R> {
+impl<R: Read> Reader<R> {
     pub fn new(reader: R) -> Self {
         Self {
-            inner: reader,
+            inner: BufReader::with_capacity(BUF_SIZE, reader),
             group: Group::Flag,
         }
     }
@@ -31,16 +31,13 @@ pub enum Error {
     Parse,
 }
 
-impl<R: BufRead> Iterator for Reader<R> {
+impl<R: Read> Iterator for Reader<R> {
     type Item = Result<Item, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let buf = match self.inner.fill_buf() {
-                Ok(buf) if buf.is_empty() => return None,
-                Ok(buf) => buf,
-                Err(e) => return Some(Err(Error::Io(e))),
-            };
+            let buf = self.inner.buffer();
+            let before_len = buf.len();
 
             match Item::parse(Span::new(buf)) {
                 Ok((rest, item)) => {
@@ -53,7 +50,11 @@ impl<R: BufRead> Iterator for Reader<R> {
 
                     return Some(Ok(item));
                 }
-                Err(nom::Err::Incomplete(_)) => (),
+                Err(nom::Err::Incomplete(_)) => match self.inner.fill_buf() {
+                    Ok(buf) if buf.len() == before_len => return None,
+                    Ok(_) => continue,
+                    Err(e) => return Some(Err(Error::Io(e))),
+                },
                 Err(nom::Err::Error(_e) | nom::Err::Failure(_e)) => return Some(Err(Error::Parse)),
             }
         }

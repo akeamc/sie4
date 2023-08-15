@@ -30,12 +30,6 @@ pub enum Group {
 
 type Amount = Decimal;
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Field {
-    Text(String),
-    List(Vec<String>),
-}
-
 trait ParsableItem {
     fn parse(i: Span) -> IResult<Span, Self>
     where
@@ -50,11 +44,18 @@ trait ParseField {
         Self: Sized;
 }
 
+#[allow(clippy::module_name_repetitions)]
 pub trait Sie4Item {
     const LABEL: &'static str;
 
     const GROUP: Group;
 
+    /// Parse an item from the input.
+    /// 
+    /// # Errors
+    /// 
+    /// As with other nom parsers, this function returns an error if the
+    /// input is not a valid item or if the input is incomplete.
     fn parse_item(i: Span) -> IResult<Span, Self>
     where
         Self: Sized;
@@ -227,6 +228,25 @@ macro_rules! items_impl {
         )*
 
         impl Item {
+            /// Parse an item from the beginning of the input.
+            /// 
+            /// # Example
+            /// 
+            /// ```
+            /// use sie4::{item::{Item, Program}, Span};
+            /// let span = Span::new(b"#PROGRAM \"Vi iMproved\" 9.0\n");
+            /// assert_eq!(
+            ///     Item::parse(span).unwrap().1,
+            ///     Item::Program(Program {
+            ///         name: "Vi iMproved".to_owned(),
+            ///         version: "9.0".to_owned(),
+            ///     }),
+            /// );
+            /// ```
+            /// 
+            /// # Errors
+            /// 
+            /// Returns an error if the input is invalid or incomplete.
             pub fn parse(i: Span) -> IResult<Span, Self> {
                 let (i, _) = take_while(|c| is_whitespace(c) || is_line_break(c))(i)?;
 

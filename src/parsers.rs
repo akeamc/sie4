@@ -38,18 +38,12 @@ pub fn unquoted_text(i: Span) -> IResult<Span, Span> {
 pub fn quoted_text(i: Span) -> IResult<Span, Span> {
     let esc = escaped(none_of("\\\""), '\\', tag("\""));
     let esc_or_empty = alt((esc, tag("")));
-    let (i, o) = delimited(tag("\""), esc_or_empty, tag("\""))(i)?;
-
-    println!("{}", Cow::borrow_from_cp437(&o, &CP437_CONTROL));
-
-    Ok((i, o))
+    delimited(tag("\""), esc_or_empty, tag("\""))(i)
 }
 
 pub fn text(i: Span) -> IResult<Span, String> {
     map(alt((quoted_text, unquoted_text)), |span| {
-        let bytes: &[u8] = span.as_ref();
-        println!("{:?} {:?}", bytes, std::str::from_utf8(bytes));
-        Cow::borrow_from_cp437(bytes, &CP437_CONTROL).into_owned()
+        Cow::borrow_from_cp437(span.as_ref(), &CP437_CONTROL).into_owned()
     })(i)
 }
 
