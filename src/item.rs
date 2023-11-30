@@ -1,3 +1,5 @@
+//! Each file consists of a number of items.
+
 use std::fmt::Debug;
 
 use codepage_437::{BorrowFromCp437, CP437_CONTROL};
@@ -13,30 +15,28 @@ use nom::{
     IResult,
 };
 use rust_decimal::Decimal;
-use time::{format_description::FormatItem, macros::format_description, Date};
+use time::Date;
 
 use crate::{
     parsers::{self, date, in_curly_braces, is_line_break, is_whitespace, text, unquoted_text},
     Span,
 };
 
+/// Items are grouped into four groups, that must not appear out of order
+/// in the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
+    /// The first group is constituted by [`Flagga`] only.
     Flag,
+    /// The second group contains metadata about the file, such as
+    /// which program generated the file ([`Program`]) and the company
+    /// name ([`FNamn`]).
     Identification,
     Account,
     Balance,
 }
 
 type Amount = Decimal;
-
-trait ParsableItem {
-    fn parse(i: Span) -> IResult<Span, Self>
-    where
-        Self: Sized;
-}
-
-pub const DATE_FORMAT: &[FormatItem] = format_description!("[year][month][day]");
 
 trait ParseField {
     fn parse_field(i: Span) -> IResult<Span, Self>
@@ -45,18 +45,21 @@ trait ParseField {
 }
 
 #[allow(clippy::module_name_repetitions)]
-pub trait Sie4Item {
+pub trait ItemType {
+    /// Each item type is identified by a label prefixed with `#`,
+    /// e.g. `#PROGRAM` (parsed as [`Program`]).
     const LABEL: &'static str;
 
+    /// Group that this item belongs to. See [`Group`].
     const GROUP: Group;
 
     /// Parse an item from the input.
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// As with other nom parsers, this function returns an error if the
     /// input is not a valid item or if the input is incomplete.
-    fn parse_item(i: Span) -> IResult<Span, Self>
+    fn parse(i: Span) -> IResult<Span, Self>
     where
         Self: Sized;
 }
@@ -121,10 +124,20 @@ impl<T: ParseField> ParseField for Option<T> {
     }
 }
 
+/// Sub-entries are enclosed in curly braces that should be free-standing
+/// on their own lines:
+///
+/// ```txt
+/// #VER A 567 20081216 "Cash salary"
+/// {
+///     #TRANS 7010 {"1" "456" "7" "47"} 13200.00
+///     #TRANS 1910 {} -13200.00
+/// }
+/// ```
 #[derive(Debug, PartialEq, Eq)]
-pub struct SubItems<T>(pub Vec<T>);
+pub struct SubEntries<T>(pub Vec<T>);
 
-impl<T: Sie4Item> ParseField for SubItems<T> {
+impl<T: ItemType> ParseField for SubEntries<T> {
     fn parse_field(i: Span) -> IResult<Span, Self>
     where
         Self: Sized,
@@ -134,7 +147,7 @@ impl<T: Sie4Item> ParseField for SubItems<T> {
         let (_, items) = many0(complete(|i| {
             let (i, _) = take_while(|c| c != b'#')(i)?;
             let (i, _) = preceded(char('#'), tag(T::LABEL))(i)?;
-            T::parse_item(i)
+            T::parse(i)
         }))(o)?;
 
         Ok((i, Self(items)))
@@ -194,12 +207,12 @@ macro_rules! item_impl {
                 )*
             }
 
-            impl Sie4Item for $name {
+            impl ItemType for $name {
                 const LABEL: &'static str = stringify!([<$name:upper>]);
 
                 const GROUP: Group = Group::$group;
 
-                fn parse_item(i: Span) -> IResult<Span, Self> {
+                fn parse(i: Span) -> IResult<Span, Self> {
                     $(
                         let (i, _) = take_while(is_whitespace)(i)?;
                         let (i, $field) = context(stringify!($field), <$ty>::parse_field)(i)?;
@@ -229,9 +242,9 @@ macro_rules! items_impl {
 
         impl Item {
             /// Parse an item from the beginning of the input.
-            /// 
+            ///
             /// # Example
-            /// 
+            ///
             /// ```
             /// use sie4::{item::{Item, Program}, Span};
             /// let span = Span::new(b"#PROGRAM \"Vi iMproved\" 9.0\n");
@@ -243,9 +256,9 @@ macro_rules! items_impl {
             ///     }),
             /// );
             /// ```
-            /// 
+            ///
             /// # Errors
-            /// 
+            ///
             /// Returns an error if the input is invalid or incomplete.
             pub fn parse(i: Span) -> IResult<Span, Self> {
                 let (i, _) = take_while(|c| is_whitespace(c) || is_line_break(c))(i)?;
@@ -253,13 +266,14 @@ macro_rules! items_impl {
                 paste::paste! {
                     preceded(tag("#"), alt(($(
                         map(
-                            preceded(tag(stringify!([<$name:upper>])), $name::parse_item),
+                            preceded(tag(stringify!([<$name:upper>])), $name::parse),
                             Self::$name,
                         ),
                     )*)))(i)
                 }
             }
 
+            /// See [`Group`].
             #[must_use]
             pub const fn group(&self) -> Group {
                 paste::paste! {
@@ -274,8 +288,12 @@ macro_rules! items_impl {
     }
 }
 
+/// "Format type" (encoding).
 #[derive(Debug, PartialEq, Eq)]
 pub enum FormatType {
+    /// Code page 437, also known as PC-8.
+    ///
+    /// [Wikipedia](https://en.wikipedia.org/wiki/Code_page_437)
     PC8,
 }
 
@@ -288,8 +306,10 @@ impl ParseField for FormatType {
     }
 }
 
+/// SIE "file type number" (version).
 #[derive(Debug, PartialEq, Eq)]
 pub enum TypeNo {
+    /// Parsed from `4`.
     SIE4,
 }
 
@@ -409,7 +429,7 @@ items_impl! {
         text: Option<String>,
         reg_date: Option<Date>,
         sign: Option<String>,
-        transactions: SubItems<Trans>,
+        transactions: SubEntries<Trans>,
     }
 }
 
@@ -466,7 +486,7 @@ mod tests {
                 text: Some("Pi Day".to_owned()),
                 reg_date: Some(date!(2023 - 03 - 14)),
                 sign: None,
-                transactions: SubItems(vec![
+                transactions: SubEntries(vec![
                     Trans {
                         account: 1930,
                         objects: List(vec![]),
@@ -493,7 +513,7 @@ mod tests {
     #[test]
     fn parse_transaction() {
         assert_eq!(
-            Trans::parse_item(Span::new(b" 1930 {} 192.00 20230320 \"Stonks\"\n"))
+            Trans::parse(Span::new(b" 1930 {} 192.00 20230320 \"Stonks\"\n"))
                 .unwrap()
                 .1,
             Trans {
@@ -508,9 +528,7 @@ mod tests {
         );
 
         assert_eq!(
-            Trans::parse_item(Span::new(b" 1930 {}\t\t 583.52\n"))
-                .unwrap()
-                .1,
+            Trans::parse(Span::new(b" 1930 {}\t\t 583.52\n")).unwrap().1,
             Trans {
                 account: 1930,
                 objects: Default::default(),
@@ -522,6 +540,6 @@ mod tests {
             }
         );
 
-        assert!(Trans::parse_item(Span::new(b" 1930 {} 583.52 \"Stonks\"")).is_err());
+        assert!(Trans::parse(Span::new(b" 1930 {} 583.52 \"Stonks\"")).is_err());
     }
 }

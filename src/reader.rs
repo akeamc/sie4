@@ -1,4 +1,4 @@
-use std::io::{Read, BufRead};
+use std::io::{BufRead, Read};
 
 use nom_bufreader::bufreader::BufReader;
 
@@ -29,6 +29,10 @@ pub enum Error {
     Io(std::io::Error),
     #[error("parse error")]
     Parse,
+    /// SIE4 items must be ordered in ascending order by group
+    /// (see [`crate::item::Group`]).
+    #[error("items out of order")]
+    OutOfOrder,
 }
 
 impl<R: Read> Iterator for Reader<R> {
@@ -44,7 +48,9 @@ impl<R: Read> Iterator for Reader<R> {
                     let offset = rest.location_offset();
                     self.inner.consume(offset);
 
-                    assert!(self.group <= item.group());
+                    if self.group > item.group() {
+                        return Some(Err(Error::OutOfOrder));
+                    }
 
                     self.group = item.group();
 

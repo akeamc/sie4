@@ -22,7 +22,6 @@ pub fn is_whitespace(c: u8) -> bool {
 pub fn is_line_break(c: u8) -> bool {
     c == b'\n' || c == b'\r'
 }
-
 pub const DATE_FORMAT: &[FormatItem] = format_description!("[year][month][day]");
 
 pub fn in_curly_braces(i: Span) -> IResult<Span, Span> {
